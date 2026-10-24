@@ -120,7 +120,11 @@ ASK_OPEN=yes;  if [[ -n ${OPEN_PORTS+x} ]]; then ASK_OPEN=no;  fi
 : "${LOCK_ROOT_PASSWORD:=no}"
 : "${GUEST_AGENT:=keep}"         # keep | disable
 : "${EXTRA_PACKAGES:=htop}"
-: "${ROLLBACK_MINUTES:=10}"
+: "${ROLLBACK_MINUTES:=2}"
+if [[ $ROLLBACK_MINUTES =~ ^[0-9]+$ && $ROLLBACK_MINUTES -gt 2 ]]; then
+  warn "ROLLBACK_MINUTES=$ROLLBACK_MINUTES больше максимума 2; использую 2"
+  ROLLBACK_MINUTES=2
+fi
 
 TTY_OK=no; if { : </dev/tty; } 2>/dev/null; then TTY_OK=yes; fi
 HAS_TTY=$TTY_OK; if [[ $ASSUME_YES == yes ]]; then HAS_TTY=no; fi
@@ -171,7 +175,7 @@ confirm() { local a; a=$(ask "$1 (y/n)" "${2:-y}"); [[ ${a,,} =~ ^(y|yes|д|да
 
 apt_get() {
   DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
-  apt-get -yq -o DPkg::Lock::Timeout=600 \
+  apt-get -yq -o DPkg::Lock::Timeout=120 \
     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
 }
 
@@ -276,7 +280,7 @@ preflight() {
   fi
   case $SSH_ROOT_LOGIN in no|prohibit-password) ;; *) die "SSH_ROOT_LOGIN: no | prohibit-password";; esac
   case $SSH_TCP_FORWARDING in no|local|remote|yes) ;; *) die "SSH_TCP_FORWARDING: no|local|remote|yes";; esac
-  [[ $ROLLBACK_MINUTES =~ ^[0-9]+$ && $ROLLBACK_MINUTES -ge 3 ]] || die "ROLLBACK_MINUTES >= 3"
+  [[ $ROLLBACK_MINUTES =~ ^[0-9]+$ && $ROLLBACK_MINUTES -ge 2 ]] || die "ROLLBACK_MINUTES >= 2"
 }
 
 gather_input() {
@@ -325,7 +329,7 @@ gather_input() {
 install_base() {
   step "Базовые пакеты"
   if command -v cloud-init >/dev/null 2>&1; then
-    info "Жду завершения cloud-init…"; timeout 600 cloud-init status --wait >/dev/null 2>&1 || true
+    info "Жду завершения cloud-init…"; timeout 120 cloud-init status --wait >/dev/null 2>&1 || true
   fi
   apt_get update
   apt_get install openssh-server openssh-client sudo curl ca-certificates iproute2
