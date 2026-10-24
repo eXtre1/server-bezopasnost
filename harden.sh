@@ -10,11 +10,12 @@
 #    bash harden.sh --rollback            вручную откатить SSH и firewall
 #
 #  Поддержка: Debian 11–13, Ubuntu 20.04+; Proxmox VE и LXC — с поправками.
+#  Защита от брутфорса: fail2ban (по умолчанию) или CrowdSec (CROWDSEC=yes).
 # =============================================================================
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="2.0"
+readonly SCRIPT_VERSION="2.1"
 readonly STATE_DIR=/root/.harden
 readonly SSHD_DROPIN=/etc/ssh/sshd_config.d/00-harden.conf
 readonly SSHD_TRANSITION=/etc/ssh/sshd_config.d/01-harden-transition.conf
@@ -104,6 +105,10 @@ ASK_OPEN=yes;  if [[ -n ${OPEN_PORTS+x} ]]; then ASK_OPEN=no;  fi
 : "${OPEN_PORTS:=}"              # "80/tcp 443/tcp 51820/udp"
 : "${FAIL2BAN:=yes}"
 : "${TRUSTED_IPS:=}"             # никогда не банить
+: "${CROWDSEC:=no}"              # yes = CrowdSec + nftables-bouncer вместо fail2ban
+: "${CROWDSEC_COLLECTIONS:=crowdsecurity/linux crowdsecurity/sshd}"
+: "${CROWDSEC_ENROLL_KEY:=}"     # ключ из app.crowdsec.net (необязательно)
+: "${CROWDSEC_LAPI_PORT:=8080}"  # локальный API; если занят — подберётся свободный
 : "${UPGRADE:=yes}"
 : "${AUTO_UPDATES:=yes}"
 : "${AUTO_REBOOT:=no}"
@@ -260,8 +265,11 @@ preflight() {
     SSH_PORT=22; ASK_PORT=no; SSH_ROOT_LOGIN=prohibit-password; FIREWALL=no
   fi
   if [[ $IS_CT == yes ]]; then
-    warn "Контейнер ($VIRT): firewall, fail2ban, sysctl и hostname — на стороне хоста, пропускаю."
-    FIREWALL=no; FAIL2BAN=no; SYSCTL_HARDEN=no; NET_TUNING=no; NEW_HOSTNAME=""
+    warn "Контейнер ($VIRT): firewall, fail2ban/CrowdSec, sysctl и hostname — на стороне хоста, пропускаю."
+    FIREWALL=no; FAIL2BAN=no; CROWDSEC=no; SYSCTL_HARDEN=no; NET_TUNING=no; NEW_HOSTNAME=""
+  fi
+  if [[ $CROWDSEC == yes && $FAIL2BAN == yes ]]; then
+    info "CROWDSEC=yes — fail2ban не ставлю (две системы банов не нужны)"; FAIL2BAN=no
   fi
   if [[ $HAS_DOCKER == yes && $FIREWALL == yes ]]; then
     warn "Docker: опубликованные порты (-p) ОБХОДЯТ UFW. Публикуй на 127.0.0.1 или используй DOCKER-USER."
@@ -359,7 +367,7 @@ show_plan() {
     "SSH:" "порт $SSH_PORT$old; только ключи; root: $SSH_ROOT_LOGIN" \
     "SSH доступ с:" "${SSH_ALLOW_FROM:-любых адресов}" \
     "Firewall:" "$( [[ $FIREWALL == yes ]] && echo "UFW, входящие закрыты; открыть: ${OPEN_PORTS:-только SSH}" || echo нет )" \
-    "fail2ban:" "$FAIL2BAN" \
+    "Брутфорс:" "$( if [[ $CROWDSEC == yes ]]; then echo 'CrowdSec + nftables-bouncer'; elif [[ $FAIL2BAN == yes ]]; then echo fail2ban; else echo нет; fi )" \
     "Обновления:" "upgrade=$UPGRADE, авто-security=$AUTO_UPDATES, авто-reboot=$AUTO_REBOOT" \
     "sysctl:" "$SYSCTL_HARDEN (BBR: $NET_TUNING)" \
     "Автооткат:" "через $ROLLBACK_MINUTES мин без подтверждения (SSH + firewall)"
@@ -547,6 +555,7 @@ if command -v ufw >/dev/null 2>&1; then
   fi
 fi
 systemctl stop fail2ban 2>/dev/null
+systemctl stop crowdsec-firewall-bouncer 2>/dev/null
 mkdir -p /run/sshd
 systemctl restart ssh.service || systemctl restart sshd.service
 rm -f "$STATE_DIR/state"
@@ -742,10 +751,114 @@ EOF
   else warn "jail sshd не поднялся: journalctl -u fail2ban"; fi
 }
 
+apply_crowdsec() {
+  [[ $CROWDSEC == yes ]] || return 0
+  step "CrowdSec"
+  local port=$CROWDSEC_LAPI_PORT p
+  # LAPI по умолчанию на 127.0.0.1:8080 — порт часто занят веб-приложениями
+  if ! systemctl is-active --quiet crowdsec 2>/dev/null && ss -Hltn "sport = :$port" | grep -q .; then
+    for p in $(seq 8089 8099); do
+      if ! ss -Hltn "sport = :$p" | grep -q .; then port=$p; break; fi
+    done
+    warn "Порт $CROWDSEC_LAPI_PORT занят — LAPI CrowdSec будет на 127.0.0.1:$port"
+  fi
+  install -d /etc/crowdsec
+  if [[ $port != 8080 && ! -f /etc/crowdsec/config.yaml.local ]]; then
+    printf 'api:\n  server:\n    listen_uri: 127.0.0.1:%s\n' "$port" > /etc/crowdsec/config.yaml.local
+  fi
+
+  # Официальный репозиторий: в Debian/Ubuntu лежит устаревшая 1.4.x
+  if ! apt-cache policy crowdsec 2>/dev/null | grep -q 'packagecloud.io/crowdsec'; then
+    info "Подключаю официальный репозиторий CrowdSec"
+    if ! curl -fsSL https://install.crowdsec.net | sh >/dev/null; then
+      warn "Не удалось подключить репозиторий CrowdSec — пропускаю (fail2ban тоже не ставился!)"; return 0
+    fi
+    apt_get update
+  fi
+  if ! apt-cache policy crowdsec 2>/dev/null | grep -q 'packagecloud.io/crowdsec'; then
+    warn "В репозитории CrowdSec нет пакетов для этого релиза — пропускаю, чтобы не ставить старую 1.4.x"; return 0
+  fi
+  apt_get install crowdsec crowdsec-firewall-bouncer-nftables nftables
+  ok "Установлено: $(cscli version 2>/dev/null | awk -F': *' '/^version/{print $2; exit}')"
+
+  # На случай, если пакет записал адрес LAPI по умолчанию
+  if [[ $port != 8080 ]]; then
+    sed -i -E "s#^url:.*#url: http://127.0.0.1:$port#" /etc/crowdsec/local_api_credentials.yaml
+    sed -i -E "s#^api_url:.*#api_url: http://127.0.0.1:$port/#" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+  fi
+
+  # Ключ bouncer'а: обычно регистрируется сам, иначе — вручную
+  local by=/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml key
+  if grep -qE '^api_key:[[:space:]]*(\$\{API_KEY\})?[[:space:]]*$' "$by"; then
+    systemctl restart crowdsec; sleep 2
+    key=$(cscli bouncers add "fw-$(hostname -s)-$TS" -o raw)
+    sed -i "s|^api_key:.*|api_key: $key|" "$by"
+    ok "Bouncer зарегистрирован вручную"
+  fi
+
+  cscli hub update >/dev/null 2>&1 || warn "cscli hub update не прошёл"
+  local c
+  for c in $CROWDSEC_COLLECTIONS; do
+    if cscli collections install "$c" >/dev/null 2>&1; then ok "Коллекция: $c"; else warn "Не удалось установить $c"; fi
+  done
+
+  # Debian 12+: rsyslog нет, логи SSH только в journald
+  install -d /etc/crowdsec/acquis.d
+  if [[ ! -f /var/log/auth.log ]]; then
+    cat > /etc/crowdsec/acquis.d/harden-sshd.yaml <<'EOF'
+# harden.sh: auth.log нет — читаем sshd из journald
+source: journalctl
+journalctl_filter:
+  - "_SYSTEMD_UNIT=ssh.service"
+labels:
+  type: syslog
+EOF
+    ok "Источник логов SSH: journald"
+  fi
+
+  # Доверенные адреса никогда не банятся
+  local i list='    - "127.0.0.0/8"'$'\n''    - "::1/128"'$'\n'
+  for i in $TRUSTED_IPS $SSH_ALLOW_FROM; do
+    if [[ $i != */* ]]; then
+      if [[ $i == *:* ]]; then i+=/128; else i+=/32; fi
+    fi
+    list+="    - \"$i\""$'\n'
+  done
+  install -d /etc/crowdsec/parsers/s02-enrich
+  {
+    echo 'name: harden/whitelist'
+    echo 'description: "Доверенные адреса (harden.sh)"'
+    echo 'whitelist:'
+    echo '  reason: "trusted (harden.sh)"'
+    echo '  cidr:'
+    printf '%s' "$list"
+  } > /etc/crowdsec/parsers/s02-enrich/harden-whitelist.yaml
+
+  if [[ -n $CROWDSEC_ENROLL_KEY ]]; then
+    if cscli console enroll --name "$(hostname -s)" "$CROWDSEC_ENROLL_KEY" >/dev/null 2>&1; then
+      ok "Запрос в консоль отправлен — подтверди сервер в app.crowdsec.net"
+    else warn "Не удалось отправить enroll в консоль"; fi
+  fi
+
+  systemctl enable crowdsec crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+  systemctl restart crowdsec
+  sleep 2
+  systemctl restart crowdsec-firewall-bouncer
+  sleep 2
+  if systemctl is-active --quiet crowdsec && systemctl is-active --quiet crowdsec-firewall-bouncer; then
+    ok "CrowdSec и bouncer работают (бан-листы сообщества подтягиваются автоматически)"
+  else
+    warn "CrowdSec или bouncer не запустились: journalctl -u crowdsec -u crowdsec-firewall-bouncer"
+  fi
+}
+
 report() {
   step "Итог"
   if [[ $FIREWALL == yes ]]; then ufw status verbose | sed 's/^/    /' || true; fi
   info "Слушающие порты:"; ss -ltnup | sed 's/^/    /' || true
+  if [[ $CROWDSEC == yes ]] && command -v cscli >/dev/null 2>&1; then
+    info "CrowdSec bouncers:"; cscli bouncers list 2>/dev/null | sed 's/^/    /' || true
+  fi
   if [[ -f /var/run/reboot-required ]]; then warn "Нужна перезагрузка (ядро/библиотеки) — после подтверждения: sudo reboot"; fi
   info "Лог: $LOG   Бэкап: $BACKUP_DIR"
   if [[ -n $GENERATED_PW ]]; then
@@ -800,6 +913,7 @@ main() {
   setup_sysctl
   setup_logging
   setup_auto_updates
+  apply_crowdsec
   write_rollback
   write_confirm
   schedule_rollback
